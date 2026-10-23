@@ -1,0 +1,27 @@
+# gradle
+.gradle/
+build/
+out/
+classes/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.settings/
+.vscode/
+bin/
+.classpath
+.project
+
+# 构建产物（通过 GitHub Actions / Release 分发）
+artifacts/
+
+# 日志
+*.log
+hs_err_pid*
+replay_pid*
+
+# 本地脚本缓存
+download_cache/

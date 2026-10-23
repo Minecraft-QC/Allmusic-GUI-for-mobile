@@ -1,0 +1,393 @@
+package com.allmusicgui.client.netease;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+import com.allmusicgui.AllMusicGUI;
+import com.allmusicgui.model.SearchType;
+import com.allmusicgui.model.Song;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+/**
+ * 网易云音乐非官方 API 客户端（搜索 / 歌单详情 / 账号 / 我的歌单）。
+ * 使用 JDK 自带 HttpClient + Minecraft 自带的 Gson，无额外依赖。
+ * 请求头对齐原版 AllMusic：桌面 Chrome UA + Referer。
+ */
+public final class NeteaseApi {
+	private static final String UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0";
+
+	private static final HttpClient HTTP = HttpClient.newBuilder()
+			.connectTimeout(Duration.ofSeconds(10))
+			.followRedirects(HttpClient.Redirect.NORMAL)
+			.build();
+
+	/** 已保存的登录 Cookie（主要是 MUSIC_U），可被 PlaylistStore 载入 */
+	private static volatile String cookie = "os=pc; appver=8.9.70";
+
+	public static void setCookie(String c) {
+		cookie = (c == null || c.isBlank()) ? "os=pc; appver=8.9.70" : c;
+	}
+
+	public static String getCookie() {
+		return cookie;
+	}
+
+	/** 一次接口调用的结果：成功 + 歌曲列表，或失败 + 错误信息 */
+	public record NeteaseResult(boolean ok, String error, List<Song> songs) {
+		public static NeteaseResult fail(String msg) {
+			return new NeteaseResult(false, msg, List.of());
+		}
+
+		public static NeteaseResult ok(List<Song> songs) {
+			return new NeteaseResult(true, "", songs);
+		}
+	}
+
+	/** 登录账号信息 */
+	public record Account(boolean ok, String error, long uid, String nickname) {
+		public static Account fail(String msg) {
+			return new Account(false, msg, 0, "");
+		}
+	}
+
+	private NeteaseApi() {
+	}
+
+	// ---------- 搜索 / 歌单 ----------
+
+	/** 搜索：keyword 可为名称/歌手/歌单名，type 决定结果类型 */
+	public static CompletableFuture<NeteaseResult> search(String keyword, SearchType type, int limit) {
+		String url = "https://music.163.com/api/search/get/web?s=" + enc(keyword)
+				+ "&type=" + type.neteaseType + "&limit=" + limit + "&offset=0";
+		return getJson(url).thenApply(json -> {
+			try {
+				JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+				int code = root.has("code") ? root.get("code").getAsInt() : -1;
+				if (code != 200) return NeteaseResult.fail("接口返回 code=" + code);
+				JsonObject result = root.getAsJsonObject("result");
+				if (result == null) return NeteaseResult.ok(new ArrayList<>());
+				List<Song> out = new ArrayList<>();
+				switch (type) {
+					case SONG -> collectSongs(result.getAsJsonArray("songs"), out);
+					case ARTIST -> collectArtists(result.getAsJsonArray("artists"), out);
+					case ALBUM -> collectAlbums(result.getAsJsonArray("albums"), out);
+					case PLAYLIST -> collectPlaylists(result.getAsJsonArray("playlists"), out);
+				}
+				return NeteaseResult.ok(out);
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.warn("[AllMusicGUI] 搜索结果解析失败", e);
+				return NeteaseResult.fail("返回内容解析失败");
+			}
+		});
+	}
+
+	/** 网易云歌单详情（含歌曲列表）。v6/detail 对部分歌单只返回少量 tracks，用 trackIds + song/detail 拉全量兜底 */
+	public static CompletableFuture<NeteaseResult> playlist(long id) {
+		String url = "https://music.163.com/api/v6/playlist/detail?id=" + id;
+		return getJson(url).thenApply(json -> {
+			try {
+				JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+				int code = root.has("code") ? root.get("code").getAsInt() : -1;
+				if (code != 200) return NeteaseResult.fail("接口返回 code=" + code);
+				JsonObject pl = root.getAsJsonObject("playlist");
+				if (pl == null) return NeteaseResult.fail("歌单不存在或已下架");
+				List<Song> out = new ArrayList<>();
+				collectSongs(pl.getAsJsonArray("tracks"), out);
+				// 全量歌曲 ID（v6 可能只返回前若干首，trackIds 是完整列表）
+				JsonArray trackIds = pl.has("trackIds") && !pl.get("trackIds").isJsonNull()
+						? pl.getAsJsonArray("trackIds") : null;
+				if (trackIds != null && trackIds.size() > out.size()) {
+					StringBuilder sb = new StringBuilder("[");
+					boolean first = true;
+					int n = Math.min(trackIds.size(), 1000);
+					for (int i = 0; i < n; i++) {
+						JsonElement te = trackIds.get(i);
+						if (te == null || te.isJsonNull() || !te.getAsJsonObject().has("id")) continue;
+						if (!first) sb.append(",");
+						sb.append("{\"id\":").append(te.getAsJsonObject().get("id").getAsLong()).append("}");
+						first = false;
+					}
+					sb.append("]");
+					List<Song> full = songDetail(sb.toString());
+					if (full.size() >= out.size()) out = full;
+				}
+				return NeteaseResult.ok(out);
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.warn("[AllMusicGUI] 歌单解析失败", e);
+				return NeteaseResult.fail("返回内容解析失败");
+			}
+		});
+	}
+
+	/** 批量 song/detail：c 形如 [{"id":1},{"id":2}]，返回解析后的歌曲列表。
+	 *  该接口要求 query 里是未转义的 JSON（转义后返回 400），而 URI 会拒绝这些字符，
+	 *  因此这里用 URL+HttpURLConnection 绕过 URI 校验，原样发送。
+	 *  调用方已处于异步线程，故此处为同步阻塞方法。 */
+	private static List<Song> songDetail(String c) {
+		HttpURLConnection conn = null;
+		try {
+			URL u = new URL("https://music.163.com/api/v3/song/detail?c=" + c);
+			conn = (HttpURLConnection) u.openConnection();
+			conn.setRequestMethod("GET");
+			conn.setRequestProperty("User-Agent", UA);
+			conn.setRequestProperty("Referer", "https://music.163.com/");
+			conn.setRequestProperty("Cookie", cookie);
+			conn.setRequestProperty("Accept", "application/json, text/plain, */*");
+			conn.setConnectTimeout(15000);
+			conn.setReadTimeout(15000);
+			if (conn.getResponseCode() != 200) return new ArrayList<>();
+			StringBuilder sb = new StringBuilder();
+			try (BufferedReader r = new BufferedReader(
+					new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+				String line;
+				while ((line = r.readLine()) != null) sb.append(line);
+			}
+			JsonObject root = JsonParser.parseString(sb.toString()).getAsJsonObject();
+			int code = root.has("code") ? root.get("code").getAsInt() : -1;
+			if (code != 200) return new ArrayList<>();
+			List<Song> out = new ArrayList<>();
+			collectSongs(root.getAsJsonArray("songs"), out);
+			return out;
+		} catch (Exception e) {
+			AllMusicGUI.LOGGER.warn("[AllMusicGUI] song/detail 请求失败", e);
+			return new ArrayList<>();
+		} finally {
+			if (conn != null) conn.disconnect();
+		}
+	}
+
+	/** 歌手的热门歌曲（二级菜单下钻用） */
+	public static CompletableFuture<NeteaseResult> artistSongs(long id) {
+		String url = "https://music.163.com/api/v1/artist/songs?id=" + id
+				+ "&limit=100&offset=0&order=hot";
+		return getJson(url).thenApply(json -> {
+			try {
+				JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+				int code = root.has("code") ? root.get("code").getAsInt() : -1;
+				if (code != 200) return NeteaseResult.fail("接口返回 code=" + code);
+				List<Song> out = new ArrayList<>();
+				collectSongs(root.getAsJsonArray("songs"), out);
+				return NeteaseResult.ok(out);
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.warn("[AllMusicGUI] 歌手歌曲解析失败", e);
+				return NeteaseResult.fail("返回内容解析失败");
+			}
+		});
+	}
+
+	/** 专辑详情（含歌曲列表，二级菜单下钻用） */
+	public static CompletableFuture<NeteaseResult> album(long id) {
+		String url = "https://music.163.com/api/v1/album/" + id;
+		return getJson(url).thenApply(json -> {
+			try {
+				JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+				int code = root.has("code") ? root.get("code").getAsInt() : -1;
+				if (code != 200) return NeteaseResult.fail("接口返回 code=" + code);
+				List<Song> out = new ArrayList<>();
+				collectSongs(root.getAsJsonArray("songs"), out);
+				if (out.isEmpty()) {
+					JsonObject album = root.getAsJsonObject("album");
+					if (album != null) collectSongs(album.getAsJsonArray("songs"), out);
+				}
+				return NeteaseResult.ok(out);
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.warn("[AllMusicGUI] 专辑解析失败", e);
+				return NeteaseResult.fail("返回内容解析失败");
+			}
+		});
+	}
+
+	// ---------- 账号 / 我的歌单 ----------
+
+	/** 用已保存的 Cookie 校验登录态，返回昵称和 uid */
+	public static CompletableFuture<Account> accountInfo() {
+		return getJson("https://music.163.com/api/nuser/account/get").thenApply(json -> {
+			try {
+				JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+				int code = root.has("code") ? root.get("code").getAsInt() : -1;
+				if (code != 200 || !root.has("profile") || root.get("profile").isJsonNull()) {
+					return Account.fail("未登录或 Cookie 已失效（code=" + code + "）");
+				}
+				JsonObject profile = root.getAsJsonObject("profile");
+				long uid = profile.has("userId") ? profile.get("userId").getAsLong() : 0;
+				String name = safe(profile, "nickname");
+				return new Account(true, "", uid, name);
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.warn("[AllMusicGUI] 账号解析失败", e);
+				return Account.fail("账号信息解析失败");
+			}
+		});
+	}
+
+	/** 拉取该用户创建/收藏的歌单（返回 type="歌单" 的 Song 列表，id 为歌单 id） */
+	public static CompletableFuture<NeteaseResult> myPlaylists(long uid) {
+		String url = "https://music.163.com/api/user/playlist?uid=" + uid + "&limit=100&offset=0";
+		return getJson(url).thenApply(json -> {
+			try {
+				JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+				int code = root.has("code") ? root.get("code").getAsInt() : -1;
+				if (code != 200) return NeteaseResult.fail("接口返回 code=" + code);
+				List<Song> out = new ArrayList<>();
+				collectPlaylists(root.getAsJsonArray("playlist"), out);
+				return NeteaseResult.ok(out);
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.warn("[AllMusicGUI] 我的歌单解析失败", e);
+				return NeteaseResult.fail("返回内容解析失败");
+			}
+		});
+	}
+
+	// ---------- 解析 ----------
+
+	private static void collectSongs(JsonArray arr, List<Song> out) {
+		if (arr == null) return;
+		for (JsonElement e : arr) {
+			try {
+				JsonObject o = e.getAsJsonObject();
+				if (!o.has("id") || o.get("id").isJsonNull()) continue;
+				long id = o.get("id").getAsLong();
+				String name = safe(o, "name");
+				String artist = joinNames(getArray(o, "ar"));
+				if (artist.isEmpty()) artist = joinNames(getArray(o, "artists"));
+				String album = "";
+				JsonArray al = getArray(o, "al");
+				if (al != null && !al.isEmpty()) {
+					album = safe(al.get(0).getAsJsonObject(), "name");
+				} else if (o.has("album") && !o.get("album").isJsonNull()) {
+					album = safe(o.getAsJsonObject("album"), "name");
+				}
+				int dur = 0;
+				if (o.has("duration") && !o.get("duration").isJsonNull()) {
+					dur = (int) (o.get("duration").getAsLong() / 1000);
+				} else if (o.has("dt") && !o.get("dt").isJsonNull()) {
+					dur = (int) (o.get("dt").getAsLong() / 1000);
+				}
+				String sub = artist.isEmpty() ? album : (album.isEmpty() ? artist : artist + " - " + album);
+				out.add(new Song(id, name, sub, "单曲", dur));
+			} catch (Exception ignore) {
+			}
+		}
+	}
+
+	private static void collectArtists(JsonArray arr, List<Song> out) {
+		if (arr == null) return;
+		for (JsonElement e : arr) {
+			try {
+				JsonObject o = e.getAsJsonObject();
+				long id = o.get("id").getAsLong();
+				String name = safe(o, "name");
+				int size = o.has("albumSize") ? o.get("albumSize").getAsInt() : 0;
+				out.add(new Song(id, name, "专辑数 " + size, "歌手", 0));
+			} catch (Exception ignore) {
+			}
+		}
+	}
+
+	private static void collectAlbums(JsonArray arr, List<Song> out) {
+		if (arr == null) return;
+		for (JsonElement e : arr) {
+			try {
+				JsonObject o = e.getAsJsonObject();
+				long id = o.get("id").getAsLong();
+				String name = safe(o, "name");
+				String artist = "";
+				if (o.has("artist") && !o.get("artist").isJsonNull()) {
+					artist = safe(o.getAsJsonObject("artist"), "name");
+				}
+				out.add(new Song(id, name, artist, "专辑", 0));
+			} catch (Exception ignore) {
+			}
+		}
+	}
+
+	private static void collectPlaylists(JsonArray arr, List<Song> out) {
+		if (arr == null) return;
+		for (JsonElement e : arr) {
+			try {
+				JsonObject o = e.getAsJsonObject();
+				long id = o.get("id").getAsLong();
+				String name = safe(o, "name");
+				String desc = safe(o, "description");
+				int count = o.has("trackCount") ? o.get("trackCount").getAsInt() : 0;
+				String sub = desc == null || desc.isEmpty() ? count + " 首" : desc;
+				out.add(new Song(id, name, sub, "歌单", 0));
+			} catch (Exception ignore) {
+			}
+		}
+	}
+
+	// ---------- 工具 ----------
+
+	/** 安全的数组取值：缺 key / 非数组 / null 时返回 null，避免整条数据被丢弃。 */
+	private static JsonArray getArray(JsonObject o, String key) {
+		try {
+			JsonElement e = o.get(key);
+			if (e == null || e.isJsonNull() || !e.isJsonArray()) return null;
+			return e.getAsJsonArray();
+		} catch (Exception e) {
+			return null;
+		}
+	}
+
+	private static String safe(JsonObject o, String key) {
+		try {
+			JsonElement e = o.get(key);
+			if (e == null || e.isJsonNull()) return "";
+			return e.getAsString();
+		} catch (Exception e) {
+			return "";
+		}
+	}
+
+	private static String joinNames(JsonArray arr) {
+		if (arr == null || arr.isEmpty()) return "";
+		StringBuilder sb = new StringBuilder();
+		for (JsonElement e : arr) {
+			if (sb.length() > 0) sb.append(" / ");
+			sb.append(safe(e.getAsJsonObject(), "name"));
+		}
+		return sb.toString();
+	}
+
+	private static String enc(String s) {
+		return URLEncoder.encode(s, StandardCharsets.UTF_8);
+	}
+
+	private static CompletableFuture<String> getJson(String url) {
+		return CompletableFuture.supplyAsync(() -> {
+			try {
+				HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+						.header("User-Agent", UA)
+						.header("Referer", "https://music.163.com/")
+						.header("Cookie", cookie)
+						.header("Accept", "application/json, text/plain, */*")
+						.timeout(Duration.ofSeconds(15))
+						.GET()
+						.build();
+				HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+				if (resp.statusCode() != 200) {
+					return "{\"code\":" + resp.statusCode() + "}";
+				}
+				return resp.body();
+			} catch (Exception e) {
+				AllMusicGUI.LOGGER.error("[AllMusicGUI] 网易云 API 请求失败: " + url, e);
+				return "{\"error\":\"" + e.getClass().getSimpleName() + "\",\"code\":-1}";
+			}
+		});
+	}
+}
